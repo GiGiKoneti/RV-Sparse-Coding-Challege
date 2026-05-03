@@ -19,7 +19,7 @@ void sparse__multiply(
 );
 
 // =========================================================
-// TODO: USER IMPLEMENTATION
+// USER IMPLEMENTATION
 // =========================================================
 void sparse_multiply(
     int rows, int cols, const double* A, const double* x,
