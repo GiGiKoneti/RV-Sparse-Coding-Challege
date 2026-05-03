@@ -26,32 +26,58 @@ void sparse_multiply(
     int* out_nnz, double* values, int* col_indices, int* row_ptrs,
     double* y
 ) {
+    // Restrict pointers for alias analysis and vectorization hints
+    const double* __restrict rA = A;
+    const double* __restrict rx = x;
+    double* __restrict rvalues = values;
+    int* __restrict rcol_indices = col_indices;
+    int* __restrict rrow_ptrs = row_ptrs;
+    double* __restrict ry = y;
+
     int nnz = 0;
-    row_ptrs[0] = 0;
+    rrow_ptrs[0] = 0;
     
-    // Scan A and extract into CSR format
+    // Pass 1: Extract non-zero elements into CSR format via pointer traversal
     for (int i = 0; i < rows; ++i) {
         for (int j = 0; j < cols; ++j) {
-            double val = A[i * cols + j];
+            double val = *rA++;
             if (val != 0.0) {
-                values[nnz] = val;
-                col_indices[nnz] = j;
+                rvalues[nnz] = val;
+                rcol_indices[nnz] = j;
                 nnz++;
             }
         }
-        row_ptrs[i + 1] = nnz;
+        rrow_ptrs[i + 1] = nnz;
     }
     *out_nnz = nnz;
 
-    // Compute y = A * x using the extracted CSR data
+    // Pass 2: Compute Sparse Matrix-Vector Multiplication (SpMV)
     for (int i = 0; i < rows; ++i) {
-        double sum = 0.0;
-        int start = row_ptrs[i];
-        int end = row_ptrs[i + 1];
-        for (int k = start; k < end; ++k) {
-            sum += values[k] * x[col_indices[k]];
+        int start = rrow_ptrs[i];
+        int end = rrow_ptrs[i + 1];
+        
+        // Break loop-carried dependencies with multiple accumulators (ILP)
+        double sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+        int k = start;
+        
+        // 4-way unrolling with software prefetching for non-contiguous gather
+        for (; k <= end - 4; k += 4) {
+            __builtin_prefetch(&rx[rcol_indices[k + 4]], 0, 1);
+            
+            sum0 += rvalues[k]     * rx[rcol_indices[k]];
+            sum1 += rvalues[k + 1] * rx[rcol_indices[k + 1]];
+            sum2 += rvalues[k + 2] * rx[rcol_indices[k + 2]];
+            sum3 += rvalues[k + 3] * rx[rcol_indices[k + 3]];
         }
-        y[i] = sum;
+        
+        double total_sum = (sum0 + sum1) + (sum2 + sum3);
+        
+        // Remainder loop
+        for (; k < end; ++k) {
+            total_sum += rvalues[k] * rx[rcol_indices[k]];
+        }
+        
+        ry[i] = total_sum;
     }
 }
 
