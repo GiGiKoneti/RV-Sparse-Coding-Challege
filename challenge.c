@@ -4,122 +4,106 @@
 #include <time.h>
 
 // =========================================================
-// FUNCTION PROTOTYPE
-// =========================================================
-void sparse__multiply(
-    int rows,
-    int cols,
-    const double* A,
-    const double* x,
-    int* out_nnz,
-    double* values,
-    int* col_indices,
-    int* row_ptrs,
-    double* y
-);
-
-// =========================================================
 // USER IMPLEMENTATION
 // =========================================================
 void sparse_multiply(
-    int rows, int cols, const double* A, const double* x,
-    int* out_nnz, double* values, int* col_indices, int* row_ptrs,
-    double* y
+    int rows, int cols,
+    const double* restrict A, const double* restrict x,
+    int* restrict out_nnz, double* restrict values,
+    int* restrict col_indices, int* restrict row_ptrs,
+    double* restrict y
 ) {
-    // Restrict pointers for alias analysis and vectorization hints
-    const double* __restrict rA = A;
-    const double* __restrict rx = x;
-    double* __restrict rvalues = values;
-    int* __restrict rcol_indices = col_indices;
-    int* __restrict rrow_ptrs = row_ptrs;
-    double* __restrict ry = y;
+    // Validate inputs defensively (Trap 7 fix)
+    if (!A || !x || !values || !col_indices || !row_ptrs || !y || !out_nnz) return;
+    if (rows <= 0 || cols <= 0) return;
 
     int nnz = 0;
-    rrow_ptrs[0] = 0;
-    
-    // Pass 1: Extract non-zero elements into CSR format via pointer traversal
+    row_ptrs[0] = 0;
+
+    // Pass 1: Extract non-zero elements into CSR format
     for (int i = 0; i < rows; ++i) {
+        // Prevent potential int overflow on massive matrices (Trap 6 fix)
+        const double* row = &A[(size_t)i * cols];
         for (int j = 0; j < cols; ++j) {
-            double val = *rA++;
-            if (val != 0.0) {
-                rvalues[nnz] = val;
-                rcol_indices[nnz] = j;
+            // Exact comparison is safe: generated values mathematically straddle 0.0 (Trap 14)
+            if (row[j] != 0.0) {
+                values[nnz] = row[j];
+                col_indices[nnz] = j;
                 nnz++;
             }
         }
-        rrow_ptrs[i + 1] = nnz;
+        row_ptrs[i + 1] = nnz;
     }
     *out_nnz = nnz;
 
-    // Pass 2: Compute Sparse Matrix-Vector Multiplication (SpMV)
+    // Pass 2: Compute Sparse Matrix-Vector Multiplication (y = A * x)
     for (int i = 0; i < rows; ++i) {
-        int start = rrow_ptrs[i];
-        int end = rrow_ptrs[i + 1];
-        
-        // Break loop-carried dependencies with multiple accumulators (ILP)
-        double sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
-        int k = start;
-        
-        // 4-way unrolling with software prefetching for non-contiguous gather
-        for (; k <= end - 4; k += 4) {
-            __builtin_prefetch(&rx[rcol_indices[k + 4]], 0, 1);
-            
-            sum0 += rvalues[k]     * rx[rcol_indices[k]];
-            sum1 += rvalues[k + 1] * rx[rcol_indices[k + 1]];
-            sum2 += rvalues[k + 2] * rx[rcol_indices[k + 2]];
-            sum3 += rvalues[k + 3] * rx[rcol_indices[k + 3]];
+        int start = row_ptrs[i];
+        int end = row_ptrs[i + 1];
+
+        double sum = 0.0;
+        for (int k = start; k < end; ++k) {
+            sum += values[k] * x[col_indices[k]];
         }
-        
-        double total_sum = (sum0 + sum1) + (sum2 + sum3);
-        
-        // Remainder loop
-        for (; k < end; ++k) {
-            total_sum += rvalues[k] * rx[rcol_indices[k]];
-        }
-        
-        ry[i] = total_sum;
+        y[i] = sum;
     }
 }
 
 // =========================================================
 // TEST HARNESS
 // =========================================================
-int main(void) {
-    srand(time(NULL));
-    
+int main(int argc, char* argv[]) {
+    // Make tests reproducible (Trap 5 fix)
+    unsigned int seed = (argc > 1) ? (unsigned int)atoi(argv[1]) : (unsigned int)time(NULL);
+    srand(seed);
+    printf("RNG seed: %u (rerun with ./run %u to reproduce)\n\n", seed, seed);
+
     const int num_iterations = 100;
     int passed_count = 0;
 
     for (int iter = 0; iter < num_iterations; ++iter) {
         int rows = rand() % 41 + 5;
         int cols = rand() % 41 + 5;
-        double density = 0.05 + (rand() / (double) RAND_MAX) * 0.35;
-        
-        size_t mat_sz = (size_t) rows * cols;
+        double density = 0.05 + (rand() / (double)RAND_MAX) * 0.35;
+
+        // Prevent int overflow during size calculation (Trap 6 fix)
+        size_t mat_sz = (size_t)rows * cols;
 
         double* A = calloc(mat_sz, sizeof(double));
-        for (size_t i = 0; i < mat_sz; ++i) {
-            if (((double) rand() / RAND_MAX) < density) {
-                A[i] = ((double) rand() / RAND_MAX) * 20.0 - 10.0;
-            }
-        }
-
         double* values = malloc(mat_sz * sizeof(double));
         int* col_indices = malloc(mat_sz * sizeof(int));
         int* row_ptrs = malloc((rows + 1) * sizeof(int));
         double* x = malloc(cols * sizeof(double));
-        double* y_user = malloc(rows * sizeof(double));
+        
+        // Use calloc for output buffer to prevent silent NaN passes (Trap 2 fix)
+        double* y_user = calloc(rows, sizeof(double));
         double* y_ref = calloc(rows, sizeof(double));
         int out_nnz = 0;
 
-        for (int i = 0; i < cols; ++i) {
-            x[i] = ((double) rand() / RAND_MAX) * 20.0 - 10.0;
+        // Guard against allocation failures (Trap 4 fix)
+        if (!A || !values || !col_indices || !row_ptrs || !x || !y_user || !y_ref) {
+            fprintf(stderr, "Allocation failure at iter %d\n", iter);
+            free(A); free(values); free(col_indices); free(row_ptrs);
+            free(x); free(y_user); free(y_ref);
+            return 1;
         }
 
+        for (size_t i = 0; i < mat_sz; ++i) {
+            if (((double)rand() / RAND_MAX) < density) {
+                A[i] = ((double)rand() / RAND_MAX) * 20.0 - 10.0;
+            }
+        }
+
+        for (int i = 0; i < cols; ++i) {
+            x[i] = ((double)rand() / RAND_MAX) * 20.0 - 10.0;
+        }
+
+        // Dense ground truth: y_ref = A * x
         for (int i = 0; i < rows; ++i) {
             double sum = 0.0;
             for (int j = 0; j < cols; ++j) {
-                sum += A[i * cols + j] * x[j];
+                // Prevent int overflow during index calculation (Trap 6 fix)
+                sum += A[(size_t)i * cols + j] * x[j];
             }
             y_ref[i] = sum;
         }
@@ -130,21 +114,26 @@ int main(void) {
         int passed = 1;
         for (int i = 0; i < rows; ++i) {
             double diff = fabs(y_user[i] - y_ref[i]);
-            double tol = 1e-7 + 1e-7 * fabs(y_ref[i]); // Mixed absolute/relative tolerance
-            if (diff > tol) {
-                max_err = fmax(max_err, diff);
+            double tol = 1e-7 + 1e-7 * fabs(y_ref[i]);
+            
+            // Explicitly catch NaN to prevent silent pass vulnerability (Trap 11 fix)
+            if (isnan(diff) || diff > tol) {
+                if (isnan(diff) || diff > max_err) {
+                    max_err = diff; 
+                }
                 passed = 0;
             }
         }
 
         if (passed) {
             passed_count++;
+            // Don't print max_err on PASS to avoid diagnostic noise (Trap 3 fix)
+            printf("Iter %2d [%3dx%3d, density=%.2f, nnz=%4d]: PASS\n",
+                   iter, rows, cols, density, out_nnz);
+        } else {
+            printf("Iter %2d [%3dx%3d, density=%.2f, nnz=%4d]: FAIL (Max error: %.2e)\n",
+                   iter, rows, cols, density, out_nnz, max_err);
         }
-
-        printf(
-            "Iter %2d [%3dx%3d, density=%.2f, nnz=%4d]: %s (Max error: %.2e)\n",
-            iter, rows, cols, density, out_nnz, passed ? "PASS" : "FAIL", max_err
-        );
 
         free(A);
         free(values);
@@ -155,11 +144,9 @@ int main(void) {
         free(y_ref);
     }
 
-    printf(
-        "\n%s (%d/%d iterations passed)\n",
-        passed_count == num_iterations ? "All tests passed!" : "Some tests failed.",
-        passed_count, num_iterations
-    );
-           
+    printf("\n%s (%d/%d iterations passed)\n",
+           passed_count == num_iterations ? "All tests passed!" : "Some tests failed.",
+           passed_count, num_iterations);
+
     return passed_count == num_iterations ? 0 : 1;
 }

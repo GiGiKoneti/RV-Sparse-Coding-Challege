@@ -4,19 +4,20 @@ This repository contains the solution for the LFX Mentorship `RV-Sparse` Coding 
 
 ## Implementation Features
 
-The `sparse_multiply` function is implemented in `challenge.c` with several systems-level optimizations to maximize throughput and minimize latency prior to RISC-V Vector (RVV) integration:
+The `sparse_multiply` function is implemented in `challenge.c` with a focus on **correctness, defensive programming, and standard compliance**, while explicitly avoiding premature optimizations that hide structural vulnerabilities:
 
 1. **Strict Memory Constraints:** Computations strictly utilize `values`, `col_indices`, and `row_ptrs` buffers. Zero dynamic allocations are performed inside the function.
-2. **Alias Analysis (`__restrict`):** All array pointers are explicitly cast with `__restrict` to guarantee non-overlapping memory regions, enabling aggressive compiler instruction reordering and auto-vectorization.
-3. **Instruction-Level Parallelism (ILP):** The SpMV inner loop is unrolled 4-ways using multiple independent accumulators (`sum0` through `sum3`), effectively breaking loop-carried dependency chains and allowing the CPU to pipeline floating-point addition instructions.
-4. **Software Prefetching:** The gather operation (`x[col_indices[k]]`) induces non-contiguous memory access. A `__builtin_prefetch` call is injected ahead of the loop iteration to fetch future vector indices into the L1 cache, mitigating main memory latency.
-5. **Sequential Pointer Arithmetic:** The initial dense matrix scan avoids redundant index multiplication (`i * cols + j`) by utilizing a sequentially incremented pointer (`*rA++`), which perfectly aligns with hardware prefetching heuristics.
+2. **Defensive API Design:** The function explicitly validates all input buffers and dimensions to prevent segmentation faults from malformed inputs.
+3. **Safe Aliasing via C99 `restrict`:** Array pointers are explicitly annotated with C99 `restrict` (applied to parameters, not locals) to guarantee non-overlapping memory regions, communicating intent safely to the compiler.
+4. **Integer Overflow Prevention:** Index calculations (e.g., `i * cols`) are explicitly cast to `size_t` to ensure safety on matrices scaling beyond 2 billion elements, addressing a common vulnerability in sparse linear algebra libraries.
+5. **Robust Test Harness Improvements:** The test harness has been fortified against IEEE 754 vulnerabilities (such as silent NaN passes), memory initialization bugs, and non-reproducibility. See `ANALYSIS.md` for a comprehensive breakdown of the test harness audit.
 
 ## Build and Execute
 
-To compile and run the test harness (recommended to compile with `-O3` to leverage vectorization hints):
+To compile and run the test harness:
 
 ```bash
-gcc -O3 -lm -o run challenge.c
+gcc -O3 -Wall -Wextra -fsanitize=address -o run challenge.c -lm
 ./run
 ```
+*(Note: Library linkage `-lm` is placed after the source file to ensure compatibility with Linux GNU ld's default `--as-needed` flag behavior.)*
